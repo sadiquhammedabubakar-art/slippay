@@ -48,6 +48,11 @@ function relayerBase(): string {
   return base.replace(/\/relayer$/, "");
 }
 
+let cache: { rate: number; at: number } | null = null;
+// Cache the in-flight promise, not just the resolved value: concurrent cold
+// callers (several components mounting in one frame) share a single request.
+let inflight: Promise<{ rate: number; stale: boolean }> | null = null;
+
 async function fetchSharedRate(): Promise<MidRate | null> {
   try {
     const r = await fetch(`${relayerBase()}/fx/rate`);
@@ -66,18 +71,37 @@ async function fetchSharedRate(): Promise<MidRate | null> {
   }
 }
 
+async function fetchMidRate(): Promise<{ rate: number; stale: boolean }> {
+  try {
+    const r = await fetch(RATE_URL);
+    const j = await r.json();
+    const rate = Number(j?.rates?.BRL);
+    if (rate > 0) { cache = { rate, at: Date.now() }; return { rate, stale: false }; }
+  } catch { /* fall through to fallback */ }
+  return { rate: FALLBACK_BRL_PER_USD, stale: true };
+}
+
 export async function midRateBRLperUSD(): Promise<MidRate> {
+  if (cache && Date.now() - cache.at < 60_000) {
+    return { rate: cache.rate, stale: false, source: "cache", observedAt: new Date(cache.at).toISOString() };
+  }
+  if (inflight) {
+    const { rate, stale } = await inflight;
+    return { rate, stale, source: stale ? "fallback" : "shared", observedAt: new Date().toISOString() };
+  }
   const shared = await fetchSharedRate();
   if (shared) return shared;
+  inflight = fetchMidRate().finally(() => { inflight = null; });
+  const { rate, stale } = await inflight;
   return {
-    rate: FALLBACK_BRL_PER_USD,
-    stale: true,
-    source: "fallback",
+    rate,
+    stale,
+    source: stale ? "fallback" : "shared",
     observedAt: new Date().toISOString(),
   };
 }
 
-export async function quoteBRLtoUSDC(brlIn: number, spreadBps = SPREAED_BPS): Promise<Quote> {
+export async function quoteBRLtoUSDC(brlIn: number, spreadBps = SPREAD_BPS): Promise<Quote> {
   const { rate: midRate, stale, source, observedAt } = await midRateBRLperUSD();
   const quotedRate = midRate * (1 + spreadBps / 10000);
   const usdcOut = brlIn > 0 ? brlIn / quotedRate : 0;
